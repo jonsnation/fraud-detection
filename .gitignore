@@ -9,3 +9,6 @@ __pycache__/
 # Ignore logs
 logs/
 *.log
+
+*.pkl
+*.csv
