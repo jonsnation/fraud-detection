@@ -12,3 +12,4 @@ logs/
 
 *.pkl
 *.csv
+*.txt
