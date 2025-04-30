@@ -3,7 +3,7 @@ import json
 import random
 from datetime import datetime
 
-# This is the URL where your Flask API is running
+# This is the URL where the Flask API is running
 url = "http://127.0.0.1:5000/predict_full"
 
 # We're only testing traditional ML models here (not autoencoder or GNN)
