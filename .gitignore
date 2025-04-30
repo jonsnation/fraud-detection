@@ -10,6 +10,6 @@ __pycache__/
 logs/
 *.log
 
-*.pkl
+# *.pkl
 *.csv
 *.txt
