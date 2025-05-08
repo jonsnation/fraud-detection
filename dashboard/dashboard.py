@@ -262,9 +262,8 @@ with tab2:
 
     st.subheader("Real Transaction Stream from Training Data")
 
-    # API Endpoints 
+    # API Endpoints
     stream_api_url = "http://localhost:5000/predict_stream"
-    gnn_api_url = "http://localhost:5000/predict_gnn"
     gnn_context_api_url = "http://localhost:5000/predict_gnn_with_context"
 
     # OS-independent file paths
@@ -272,8 +271,8 @@ with tab2:
     gnn_dir = project_root / "gnn"
     reduced_features_path = gnn_dir / "reduced_features.csv"
     balanced_labels_path = gnn_dir / "balanced_labels.csv"
+    tree_real_data_path = project_root / "data" / "processed" / "X_subset_features.csv"
 
-    # Feature definitions
     tree_models = ["xgboost", "randomforest", "logisticregression", "gradientboosting", "mlp"]
     gnn_model = "fraudgnn"
 
@@ -281,10 +280,10 @@ with tab2:
         "TransactionAmt", "TransactionDT", "card1", "card4_freq", "card6_freq",
         "addr1", "dist1", "P_emaildomain_freq", "R_emaildomain_freq",
         "M1_freq", "M4_freq", "M5_freq", "M6_freq", "M9_freq",
-        "C1", "C2", "C8", "C11",
-        "V18", "V21", "V97", "V133", "V189", "V200", "V258", "V282", "V294", "V312",
-        "DeviceType_freq", "id_15_freq", "id_28_freq", "id_29_freq",
-        "id_31_freq", "id_35_freq", "id_36_freq", "id_37_freq", "id_38_freq"
+        "C1", "C2", "C8", "C11", "V18", "V21", "V97", "V133", "V189", "V200",
+        "V258", "V282", "V294", "V312", "DeviceType_freq", "id_15_freq",
+        "id_28_freq", "id_29_freq", "id_31_freq", "id_35_freq", "id_36_freq",
+        "id_37_freq", "id_38_freq"
     ]
 
     gnn_features = [
@@ -294,33 +293,10 @@ with tab2:
         'TransactionDT', 'TransactionAmt', 'ProductCD', 'card4', 'C8', 'C9', 'card3', 'C6'
     ]
 
-    # Random stream generator (for tree models) 
-    def generate_random_stream_sample():
-        sample = {}
-        for f in set(stream_features + gnn_features):
-            if f in ["ProductCD", "card4", "DeviceInfo", "id_31", "id_16"]:
-                sample[f] = random.choice(["value1", "value2", "value3"])
-            elif f.startswith("TransactionDT"):
-                sample[f] = random.randint(1_000_000, 2_000_000)
-            elif f.startswith("TransactionAmt"):
-                sample[f] = round(random.uniform(10, 50000), 2)
-            elif f.startswith("C") or f.startswith("id_") or f.startswith("card"):
-                sample[f] = random.randint(0, 20)
-            elif f.startswith("V"):
-                sample[f] = round(random.uniform(0, 1), 6)
-            else:
-                sample[f] = round(random.uniform(0, 1), 6)
-        sample["RiskTag"] = "HIGH"
-        return sample
-
-    def simulate_kafka_stream():
-        return pd.DataFrame([generate_random_stream_sample() for _ in range(10)])
-
-    # Top Buttons: Tree + GNN Load 
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Generate New Stream Batch", key="generate_stream_btn"):
-            st.session_state["stream_df"] = simulate_kafka_stream()
+    @st.cache_data
+    def load_real_tree_stream(n=10):
+        df = pd.read_csv(tree_real_data_path)
+        return df.sample(n=n, random_state=42).reset_index(drop=True)
 
     @st.cache_data
     def load_gnn_samples(n=10):
@@ -330,11 +306,17 @@ with tab2:
         df["isFraud"] = y
         return df.sample(n=n, random_state=42).reset_index(drop=True)
 
+    # Top Buttons: Tree + GNN Load
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Load Real Transaction Batch", key="load_real_stream_btn"):
+            st.session_state["stream_df"] = load_real_tree_stream(10)
+
     with col2:
         if st.button("Load 10 GNN Samples", key="load_gnn_samples"):
             st.session_state["gnn_df"] = load_gnn_samples(10)
 
-    # Tree Model Prediction Section 
+    # Tree Model Prediction Section
     if not st.session_state.get("stream_df", pd.DataFrame()).empty:
         df = st.session_state["stream_df"]
         st.markdown("### Tree-Based Feature View + Prediction")
@@ -345,34 +327,37 @@ with tab2:
 
         if st.button("Predict with Tree Models", key="predict_tree_btn"):
             row = df.loc[selected_tree_row].to_dict()
-            input_tree = {k: row[k] for k in tree_cols if k in row}
             tree_results = []
-            with st.spinner("Tree Models predicting..."):
+            with st.spinner("Predicting with Autoencoder-enhanced Models..."):
                 for model in tree_models:
                     try:
-                        response = requests.post(stream_api_url, json={**input_tree, "model": model})
+                        payload = {**row, "model": model}
+                        response = requests.post(stream_api_url, json=payload)
                         response.raise_for_status()
                         result = response.json()
                         pred = "FRAUD" if result["prediction"] else "LEGITIMATE"
+                        ae_flag = "YES" if result["autoencoder_flagged"] else "NO"
                         tree_results.append({
                             "Model": model.upper(),
                             "Prediction": pred,
-                            "Fraud Probability": f"{result['fraud_probability']*100:.2f}%"
+                            "Fraud Probability": f"{result['fraud_probability']*100:.2f}%",
+                            "AE Flag": ae_flag,
+                            "Reconstruction Error": f"{result['reconstruction_error']:.6f}"
                         })
-                    except:
+                    except Exception as e:
                         tree_results.append({
                             "Model": model.upper(),
                             "Prediction": "ERROR",
-                            "Fraud Probability": "N/A"
+                            "Fraud Probability": "N/A",
+                            "AE Flag": "N/A",
+                            "Reconstruction Error": "N/A"
                         })
 
-            st.markdown("#### Tree Model Results")
-            tree_df = pd.DataFrame(tree_results)
-            st.dataframe(tree_df, use_container_width=True)
+            st.markdown("#### Autoencoder-Augmented Tree Model Results")
+            st.dataframe(pd.DataFrame(tree_results), use_container_width=True)
 
-    # GNN Model Prediction Section 
+    # GNN Model Prediction Section
     gnn_df = st.session_state.get("gnn_df", pd.DataFrame())
-
     if not gnn_df.empty:
         st.markdown("### GNN Feature View + Prediction")
         gnn_cols = [c for c in gnn_features if c in gnn_df.columns]
@@ -387,9 +372,9 @@ with tab2:
                 response = requests.post(gnn_context_api_url, json=input_gnn)
                 result = response.json()
 
-                st.markdown("#### GNN Model Result (With Context)")
                 label = "FRAUD" if result["prediction"] else "LEGITIMATE"
                 color = "red" if result["prediction"] else "green"
+
                 st.markdown(f"<h3 style='text-align:center; color:{color}'>{label}</h3>", unsafe_allow_html=True)
 
                 fig = go.Figure(go.Indicator(
@@ -413,6 +398,7 @@ with tab2:
 
             except Exception as e:
                 st.error(f"GNN Context Prediction Failed: {str(e)}")
+
 
 # TAB 3
 with tab3:
