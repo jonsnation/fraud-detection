@@ -8,8 +8,10 @@ import random
 import json
 from pathlib import Path
 import joblib
+import streamlit.components.v1 as components
+import plotly.graph_objects as go
 
-# --- Setup ---
+# Setup 
 st.set_page_config(layout="wide")
 st.markdown("""
     <style>
@@ -75,11 +77,11 @@ tab1, tab2, tab3 = st.tabs(["Manual Entry", "Simulated Stream", "Advanced Test C
 
 
 
-# ========== TAB 1 ==========
+# TAB 1 
 with tab1:
     st.subheader("Enter Transaction Manually")
 
-    # === Load frequency maps from file (cached) ===
+    # Load frequency maps from file (cached)
     @st.cache_data
     def load_frequency_maps():
         freq_path = Path(__file__).resolve().parents[1] / "data" / "processed" / "frequency_maps.pkl"
@@ -249,12 +251,29 @@ with tab1:
                 st.dataframe(hist_df, use_container_width=True)
                 st.caption(f"Ensemble: {item['ensemble']} — {item['confidence']*100:.1f}% agreement")
 
-# ========== TAB 2 ==========
+# TAB 2
 with tab2:
-    st.subheader("Simulated Kafka Stream")
+    import random
+    import pandas as pd
+    import requests
+    import json
+    import plotly.graph_objects as go
+    from pathlib import Path
+
+    st.subheader("Real Transaction Stream from Training Data")
+
+    # API Endpoints 
     stream_api_url = "http://localhost:5000/predict_stream"
     gnn_api_url = "http://localhost:5000/predict_gnn"
+    gnn_context_api_url = "http://localhost:5000/predict_gnn_with_context"
 
+    # OS-independent file paths
+    project_root = Path(__file__).resolve().parent.parent
+    gnn_dir = project_root / "gnn"
+    reduced_features_path = gnn_dir / "reduced_features.csv"
+    balanced_labels_path = gnn_dir / "balanced_labels.csv"
+
+    # Feature definitions
     tree_models = ["xgboost", "randomforest", "logisticregression", "gradientboosting", "mlp"]
     gnn_model = "fraudgnn"
 
@@ -275,6 +294,7 @@ with tab2:
         'TransactionDT', 'TransactionAmt', 'ProductCD', 'card4', 'C8', 'C9', 'card3', 'C6'
     ]
 
+    # Random stream generator (for tree models) 
     def generate_random_stream_sample():
         sample = {}
         for f in set(stream_features + gnn_features):
@@ -296,14 +316,27 @@ with tab2:
     def simulate_kafka_stream():
         return pd.DataFrame([generate_random_stream_sample() for _ in range(10)])
 
-    if st.button("Generate New Stream Batch", key="generate_stream_btn"):
-        st.session_state["stream_df"] = simulate_kafka_stream()
+    # Top Buttons: Tree + GNN Load 
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Generate New Stream Batch", key="generate_stream_btn"):
+            st.session_state["stream_df"] = simulate_kafka_stream()
 
+    @st.cache_data
+    def load_gnn_samples(n=10):
+        X = pd.read_csv(reduced_features_path)
+        y = pd.read_csv(balanced_labels_path).squeeze()
+        df = X.copy()
+        df["isFraud"] = y
+        return df.sample(n=n, random_state=42).reset_index(drop=True)
+
+    with col2:
+        if st.button("Load 10 GNN Samples", key="load_gnn_samples"):
+            st.session_state["gnn_df"] = load_gnn_samples(10)
+
+    # Tree Model Prediction Section 
     if not st.session_state.get("stream_df", pd.DataFrame()).empty:
         df = st.session_state["stream_df"]
-
-
-        # === Tree Table + Prediction ===
         st.markdown("### Tree-Based Feature View + Prediction")
         tree_cols = [c for c in stream_features if c in df.columns]
         st.dataframe(df[tree_cols], use_container_width=True, height=300)
@@ -313,9 +346,7 @@ with tab2:
         if st.button("Predict with Tree Models", key="predict_tree_btn"):
             row = df.loc[selected_tree_row].to_dict()
             input_tree = {k: row[k] for k in tree_cols if k in row}
-
             tree_results = []
-            shap_contributors = {}
             with st.spinner("Tree Models predicting..."):
                 for model in tree_models:
                     try:
@@ -328,7 +359,6 @@ with tab2:
                             "Prediction": pred,
                             "Fraud Probability": f"{result['fraud_probability']*100:.2f}%"
                         })
-                        shap_contributors[model] = result.get("shap_top_contributors", {})
                     except:
                         tree_results.append({
                             "Model": model.upper(),
@@ -340,51 +370,51 @@ with tab2:
             tree_df = pd.DataFrame(tree_results)
             st.dataframe(tree_df, use_container_width=True)
 
-            fraud_votes = sum(1 for r in tree_results if r["Prediction"] == "FRAUD")
-            ensemble = "LIKELY FRAUD" if fraud_votes >= 3 else "LIKELY LEGITIMATE"
-            confidence = fraud_votes / len(tree_models)
-            st.markdown(f"**Ensemble Verdict (Tree Models Only):** {ensemble}")
-            st.markdown(f"**Models Voting FRAUD:** {', '.join([r['Model'] for r in tree_results if r['Prediction'] == 'FRAUD']) or 'None'}")
-            st.metric("Fraud Vote Confidence", f"{confidence*100:.1f}% agreement")
+    # GNN Model Prediction Section 
+    gnn_df = st.session_state.get("gnn_df", pd.DataFrame())
 
-            st.subheader("SHAP Contributors (Tree Models)")
-            shap_cols = st.columns(2)
-            for i, model in enumerate(tree_models):
-                shap_data = shap_contributors.get(model)
-                if shap_data:
-                    with shap_cols[i % 2]:
-                        shap_df = pd.DataFrame.from_dict(shap_data, orient="index", columns=["SHAP Value"])
-                        shap_df["Feature"] = shap_df.index
-                        shap_df["abs_value"] = shap_df["SHAP Value"].abs()
-                        shap_df = shap_df.sort_values("abs_value", ascending=False).drop(columns="abs_value")
-                        st.markdown(f"**{model.upper()} SHAP**")
-                        st.plotly_chart(px.bar(shap_df, x="Feature", y="SHAP Value", title=f"{model.upper()} Explanation"), use_container_width=True)
-
-        # === GNN Table + Prediction ===
+    if not gnn_df.empty:
         st.markdown("### GNN Feature View + Prediction")
-        gnn_cols = [c for c in gnn_features if c in df.columns]
-        st.dataframe(df[gnn_cols], use_container_width=True, height=300)
+        gnn_cols = [c for c in gnn_features if c in gnn_df.columns]
+        st.dataframe(gnn_df[gnn_cols], use_container_width=True, height=300)
 
-        selected_gnn_row = st.selectbox("Select transaction for GNN", df.index, key="select_gnn")
+        selected_gnn_row = st.selectbox("Select transaction for GNN", gnn_df.index, key="select_gnn")
 
-        if st.button("Predict with GNN", key="predict_gnn_btn"):
-            row = df.loc[selected_gnn_row].to_dict()
-            input_gnn = {k: row[k] for k in gnn_cols if k in row}
-
+        if st.button("Predict with GNN (Full Context)", key="predict_gnn_context_btn"):
+            row = gnn_df.loc[selected_gnn_row].to_dict()
+            input_gnn = {k: row.get(k, 0) for k in gnn_features}
             try:
-                response = requests.post(gnn_api_url, json=input_gnn)
-                response.raise_for_status()
+                response = requests.post(gnn_context_api_url, json=input_gnn)
                 result = response.json()
-                pred = "FRAUD" if result["prediction"] else "LEGITIMATE"
-                st.markdown("#### GNN Model Result")
-                st.dataframe(pd.DataFrame([{
-                    "Model": gnn_model.upper(),
-                    "Prediction": pred,
-                    "Fraud Probability": f"{result['fraud_probability']*100:.2f}%"
-                }]), use_container_width=True)
-            except Exception as e:
-                st.error(f"GNN Prediction Failed: {str(e)}")
 
+                st.markdown("#### GNN Model Result (With Context)")
+                label = "FRAUD" if result["prediction"] else "LEGITIMATE"
+                color = "red" if result["prediction"] else "green"
+                st.markdown(f"<h3 style='text-align:center; color:{color}'>{label}</h3>", unsafe_allow_html=True)
+
+                fig = go.Figure(go.Indicator(
+                    mode="gauge+number",
+                    value=result["fraud_probability"] * 100,
+                    title={'text': "Fraud Probability", 'font': {'size': 24}},
+                    gauge={
+                        'axis': {'range': [0, 100]},
+                        'bar': {'color': "crimson" if result["prediction"] else "green"},
+                        'steps': [
+                            {'range': [0, 50], 'color': "lightgreen"},
+                            {'range': [50, 100], 'color': "salmon"}
+                        ]
+                    }
+                ))
+                st.plotly_chart(fig, use_container_width=True)
+
+                actual = gnn_df.loc[selected_gnn_row, "isFraud"]
+                verdict = "Correct" if result["prediction"] == actual else "Incorrect"
+                st.markdown(f"**Prediction vs Ground Truth:** `{verdict}`")
+
+            except Exception as e:
+                st.error(f"GNN Context Prediction Failed: {str(e)}")
+
+# TAB 3
 with tab3:
     st.subheader("Advanced Test Case (Full Feature Input)")
 
