@@ -6,8 +6,8 @@ import numpy as np
 from datetime import datetime, timedelta
 import random
 import json
-
-
+from pathlib import Path
+import joblib
 
 # --- Setup ---
 st.set_page_config(layout="wide")
@@ -73,46 +73,59 @@ if "stream_df" not in st.session_state:
 
 tab1, tab2, tab3 = st.tabs(["Manual Entry", "Simulated Stream", "Advanced Test Case"])
 
+
+
 # ========== TAB 1 ==========
 with tab1:
     st.subheader("Enter Transaction Manually")
+
+    # === Load frequency maps from file (cached) ===
+    @st.cache_data
+    def load_frequency_maps():
+        freq_path = Path(__file__).resolve().parents[1] / "data" / "processed" / "frequency_maps.pkl"
+        return joblib.load(freq_path)
+
+    freq_maps = load_frequency_maps()
+    product_map = freq_maps.get("ProductCD", {})
+    email_map = freq_maps.get("P_emaildomain", {})
+
+    all_models = ["xgboost", "randomforest", "logisticregression", "gradientboosting", "mlp"]
+
     with st.form("manual_form"):
         col1, col2, col3 = st.columns(3)
         with col1:
-            amount = st.number_input("Transaction Amount ($)", min_value=0.0, value=100.0, help="Total amount of the transaction")
-            addr1 = st.number_input("Billing ZIP Code (addr1)", min_value=0, value=100, help="First part of the billing address ZIP code")
+            amount = st.number_input("Transaction Amount ($)", min_value=0.0, value=100.0)
+            addr1 = st.number_input("Billing ZIP Code (addr1)", min_value=0, value=100)
 
         with col2:
-            card1 = st.number_input("Card1 (Customer ID)", min_value=1000, value=3333, help="Primary card/customer identifier")
-            dist1 = st.number_input("Distance to Purchaser (dist1)", min_value=0.0, value=10.0, help="Distance between billing and purchasing locations")
+            card1 = st.number_input("Card1 (Customer ID)", min_value=1000, value=3333)
+            dist1 = st.number_input("Distance to Purchaser (dist1)", min_value=0.0, value=10.0)
 
         with col3:
-            product = st.selectbox("Product Code", ["W", "C", "R", "H", "S"], help="Type of product purchased")
-            email = st.text_input("Email Domain",value="gmail.com",help="Domain of the user's email address (e.g., gmail.com, yahoo.com).")
-
+            product = st.selectbox("Product Code", sorted(product_map.keys()))
+            email = st.text_input("Email Domain", value="gmail.com")
 
         mode = st.selectbox("Choose Prediction Mode", ["Compare All Models"] + [m.upper() for m in all_models])
         submitted = st.form_submit_button("Predict")
 
     if submitted:
+        # Apply frequency encoding using real maps
         transaction_input = {
             "TransactionAmt": amount,
             "card1": card1,
             "addr1": addr1,
             "dist1": dist1,
-            "ProductCD": product,
-            "P_emaildomain": email,
+            "ProductCD_freq": product_map.get(product, 0.0),
+            "P_emaildomain_freq": email_map.get(email.lower(), 0.0)
         }
 
         if mode == "Compare All Models":
             results = []
             shap_contributors = {}
-
             with st.spinner("Sending data to all models..."):
                 for model in all_models:
-                    payload = {**transaction_input, "model": model}
                     try:
-                        response = requests.post(API_URL, json=payload)
+                        response = requests.post("http://localhost:5000/predict_manual", json={**transaction_input, "model": model})
                         response.raise_for_status()
                         result = response.json()
                         results.append({
@@ -153,7 +166,6 @@ with tab1:
             )
             st.plotly_chart(prob_chart, use_container_width=True)
 
-            # Save to unified history
             st.session_state["history"].append({
                 "input": transaction_input,
                 "results": result_df.to_dict("records"),
@@ -161,7 +173,6 @@ with tab1:
                 "confidence": confidence
             })
 
-            # SHAP and Heatmap
             st.subheader("SHAP Top Contributors (per Model)")
             shap_cols = st.columns(2)
             for i, model in enumerate(all_models):
@@ -174,7 +185,7 @@ with tab1:
                         shap_fig = px.bar(shap_df, x="Feature", y="SHAP Value", title=f"{model.upper()} SHAP")
                         st.plotly_chart(shap_fig, use_container_width=True)
 
-            st.subheader("SHAP Feature Heatmap")
+            st.subheader("SHAP Feature Impact Heatmap")
             combined_shap = []
             for model, shap_data in shap_contributors.items():
                 for feature, value in shap_data.items():
@@ -192,11 +203,10 @@ with tab1:
                 st.plotly_chart(fig_heatmap, use_container_width=True)
 
         else:
-            # Single model path
             model_name = mode.lower()
             with st.spinner(f"Predicting with {mode}..."):
                 try:
-                    response = requests.post(API_URL, json={**transaction_input, "model": model_name})
+                    response = requests.post("http://localhost:5000/predict_manual", json={**transaction_input, "model": model_name})
                     response.raise_for_status()
                     result = response.json()
 
@@ -207,7 +217,6 @@ with tab1:
                     st.write(f"Prediction: **{prediction}**")
                     st.metric("Fraud Probability", f"{fraud_probability*100:.2f}%")
 
-                    # Save history for single-model case
                     st.session_state["history"].append({
                         "input": transaction_input,
                         "results": [{
@@ -231,7 +240,6 @@ with tab1:
                 except Exception as e:
                     st.error(f"Prediction failed: {e}")
 
-    # Unified prediction history for all modes
     st.subheader("Prediction History")
     with st.container():
         for idx, item in enumerate(reversed(st.session_state["history"][-5:])):
@@ -241,130 +249,141 @@ with tab1:
                 st.dataframe(hist_df, use_container_width=True)
                 st.caption(f"Ensemble: {item['ensemble']} — {item['confidence']*100:.1f}% agreement")
 
-
 # ========== TAB 2 ==========
 with tab2:
     st.subheader("Simulated Kafka Stream")
+    stream_api_url = "http://localhost:5000/predict_stream"
+    gnn_api_url = "http://localhost:5000/predict_gnn"
 
-    def generate_fraud_like_transaction():
-        return {
-            "TransactionAmt": round(random.uniform(10000, 50000), 2),
-            "card1": random.choice([9999, 8888, 7777]),
-            "addr1": random.randint(200, 400),
-            "dist1": round(random.uniform(200, 500), 2),
-            "ProductCD": random.choice(["R", "S"]),
-            "P_emaildomain": "anonymous.com",
-            "RiskTag": "HIGH"
-        }
+    tree_models = ["xgboost", "randomforest", "logisticregression", "gradientboosting", "mlp"]
+    gnn_model = "fraudgnn"
+
+    stream_features = [
+        "TransactionAmt", "TransactionDT", "card1", "card4_freq", "card6_freq",
+        "addr1", "dist1", "P_emaildomain_freq", "R_emaildomain_freq",
+        "M1_freq", "M4_freq", "M5_freq", "M6_freq", "M9_freq",
+        "C1", "C2", "C8", "C11",
+        "V18", "V21", "V97", "V133", "V189", "V200", "V258", "V282", "V294", "V312",
+        "DeviceType_freq", "id_15_freq", "id_28_freq", "id_29_freq",
+        "id_31_freq", "id_35_freq", "id_36_freq", "id_37_freq", "id_38_freq"
+    ]
+
+    gnn_features = [
+        'V233', 'V132', 'C5', 'V261', 'V134', 'V302', 'DeviceInfo', 'V184', 'V183', 'V239', 'V224', 'V291',
+        'id_31', 'V228', 'V319', 'V185', 'id_16', 'V235', 'V258', 'id_01', 'V213', 'V9', 'V98', 'V320', 'V232',
+        'id_02', 'V204', 'V115', 'V172', 'V252', 'V276', 'V210', 'V180', 'id_36', 'V46', 'V51', 'V103',
+        'TransactionDT', 'TransactionAmt', 'ProductCD', 'card4', 'C8', 'C9', 'card3', 'C6'
+    ]
+
+    def generate_random_stream_sample():
+        sample = {}
+        for f in set(stream_features + gnn_features):
+            if f in ["ProductCD", "card4", "DeviceInfo", "id_31", "id_16"]:
+                sample[f] = random.choice(["value1", "value2", "value3"])
+            elif f.startswith("TransactionDT"):
+                sample[f] = random.randint(1_000_000, 2_000_000)
+            elif f.startswith("TransactionAmt"):
+                sample[f] = round(random.uniform(10, 50000), 2)
+            elif f.startswith("C") or f.startswith("id_") or f.startswith("card"):
+                sample[f] = random.randint(0, 20)
+            elif f.startswith("V"):
+                sample[f] = round(random.uniform(0, 1), 6)
+            else:
+                sample[f] = round(random.uniform(0, 1), 6)
+        sample["RiskTag"] = "HIGH"
+        return sample
 
     def simulate_kafka_stream():
-        now = datetime.now()
-        data = []
+        return pd.DataFrame([generate_random_stream_sample() for _ in range(10)])
 
-        # Inject 3 realistic high-risk samples
-        for i in range(3):
-            transaction = generate_fraud_like_transaction()
-            transaction["TransactionDT"] = now - timedelta(seconds=5 * i)
-            data.append(transaction)
-
-        # Add 7 normal samples
-        for i in range(3, 10):
-            transaction = {
-                "TransactionDT": now - timedelta(seconds=5 * i),
-                "TransactionAmt": round(random.uniform(10, 300), 2),
-                "card1": random.choice([1111, 2222, 3333, 4444, 5555]),
-                "addr1": random.randint(1, 200),
-                "dist1": round(random.uniform(0, 15), 2),
-                "ProductCD": random.choice(["W", "C", "H"]),
-                "P_emaildomain": random.choice(["gmail.com", "yahoo.com", "hotmail.com"]),
-                "RiskTag": "LOW"
-            }
-            data.append(transaction)
-
-        return pd.DataFrame(data)
-
-    if st.button("Generate New Stream Batch"):
+    if st.button("Generate New Stream Batch", key="generate_stream_btn"):
         st.session_state["stream_df"] = simulate_kafka_stream()
 
-    if not st.session_state["stream_df"].empty:
-        def highlight_risky(row):
-            if row["RiskTag"] == "HIGH":
-                return ['background-color: #aa4400'] * len(row)
-            else:
-                return [''] * len(row)
+    if not st.session_state.get("stream_df", pd.DataFrame()).empty:
+        df = st.session_state["stream_df"]
 
-        styled_stream = st.session_state["stream_df"].style.apply(highlight_risky, axis=1)
-        st.dataframe(styled_stream, height=350, use_container_width=True)
 
-        with st.expander("Predict Fraud for a Streamed Transaction"):
-            selected_row = st.selectbox("Select a transaction to simulate:", st.session_state["stream_df"].index)
+        # === Tree Table + Prediction ===
+        st.markdown("### Tree-Based Feature View + Prediction")
+        tree_cols = [c for c in stream_features if c in df.columns]
+        st.dataframe(df[tree_cols], use_container_width=True, height=300)
 
-            if st.button("Predict selected from stream"):
-                selected_input = st.session_state["stream_df"].loc[selected_row].to_dict()
-                selected_input.pop("TransactionDT")
-                selected_input.pop("RiskTag")
+        selected_tree_row = st.selectbox("Select transaction for Tree Models", df.index, key="select_tree")
 
-                model_results = []
-                fraud_model_names = []
+        if st.button("Predict with Tree Models", key="predict_tree_btn"):
+            row = df.loc[selected_tree_row].to_dict()
+            input_tree = {k: row[k] for k in tree_cols if k in row}
 
-                with st.spinner("Predicting with all models..."):
-                    for model in all_models:
-                        payload = {**selected_input, "model": model}
-                        try:
-                            response = requests.post(API_URL, json=payload)
-                            response.raise_for_status()
-                            result = response.json()
-                            prediction = "FRAUD" if result["prediction"] == 1 else "LEGITIMATE"
-                            if result["prediction"] == 1:
-                                fraud_model_names.append(model.upper())
-                            model_results.append({
-                                "Model": model.upper(),
-                                "Prediction": prediction,
-                                "Fraud Probability": f"{result['fraud_probability']*100:.2f}%"
-                            })
-                        except Exception as e:
-                            model_results.append({
-                                "Model": model.upper(),
-                                "Prediction": "ERROR",
-                                "Fraud Probability": "N/A"
-                            })
+            tree_results = []
+            shap_contributors = {}
+            with st.spinner("Tree Models predicting..."):
+                for model in tree_models:
+                    try:
+                        response = requests.post(stream_api_url, json={**input_tree, "model": model})
+                        response.raise_for_status()
+                        result = response.json()
+                        pred = "FRAUD" if result["prediction"] else "LEGITIMATE"
+                        tree_results.append({
+                            "Model": model.upper(),
+                            "Prediction": pred,
+                            "Fraud Probability": f"{result['fraud_probability']*100:.2f}%"
+                        })
+                        shap_contributors[model] = result.get("shap_top_contributors", {})
+                    except:
+                        tree_results.append({
+                            "Model": model.upper(),
+                            "Prediction": "ERROR",
+                            "Fraud Probability": "N/A"
+                        })
 
-                model_df = pd.DataFrame(model_results)
-                st.dataframe(model_df, use_container_width=True)
+            st.markdown("#### Tree Model Results")
+            tree_df = pd.DataFrame(tree_results)
+            st.dataframe(tree_df, use_container_width=True)
 
-                # Ensemble decision
-                fraud_votes = len(fraud_model_names)
-                ensemble_label = "LIKELY FRAUD" if fraud_votes >= 3 else "LIKELY LEGITIMATE"
-                confidence = fraud_votes / len(all_models)
+            fraud_votes = sum(1 for r in tree_results if r["Prediction"] == "FRAUD")
+            ensemble = "LIKELY FRAUD" if fraud_votes >= 3 else "LIKELY LEGITIMATE"
+            confidence = fraud_votes / len(tree_models)
+            st.markdown(f"**Ensemble Verdict (Tree Models Only):** {ensemble}")
+            st.markdown(f"**Models Voting FRAUD:** {', '.join([r['Model'] for r in tree_results if r['Prediction'] == 'FRAUD']) or 'None'}")
+            st.metric("Fraud Vote Confidence", f"{confidence*100:.1f}% agreement")
 
-                st.markdown(f"**Ensemble Verdict:** {ensemble_label}")
-                st.markdown(f"**Models Voting FRAUD:** {', '.join(fraud_model_names) or 'None'}")
-                st.metric("Fraud Vote Confidence", f"{confidence*100:.1f}% agreement")
+            st.subheader("SHAP Contributors (Tree Models)")
+            shap_cols = st.columns(2)
+            for i, model in enumerate(tree_models):
+                shap_data = shap_contributors.get(model)
+                if shap_data:
+                    with shap_cols[i % 2]:
+                        shap_df = pd.DataFrame.from_dict(shap_data, orient="index", columns=["SHAP Value"])
+                        shap_df["Feature"] = shap_df.index
+                        shap_df["abs_value"] = shap_df["SHAP Value"].abs()
+                        shap_df = shap_df.sort_values("abs_value", ascending=False).drop(columns="abs_value")
+                        st.markdown(f"**{model.upper()} SHAP**")
+                        st.plotly_chart(px.bar(shap_df, x="Feature", y="SHAP Value", title=f"{model.upper()} Explanation"), use_container_width=True)
 
-                # Display SHAP Top Contributors if available
-                st.subheader("SHAP Top Contributors per Model")
+        # === GNN Table + Prediction ===
+        st.markdown("### GNN Feature View + Prediction")
+        gnn_cols = [c for c in gnn_features if c in df.columns]
+        st.dataframe(df[gnn_cols], use_container_width=True, height=300)
 
-                shap_cols = st.columns(2)
-                for i, model in enumerate(all_models):
-                    matching_result = next((r for r in model_results if r["Model"] == model.upper()), None)
-                    if matching_result and prediction != "ERROR":
-                        try:
-                            # Fetch SHAP from backend call again with explain=True (or reuse result)
-                            payload = {**selected_input, "model": model}
-                            response = requests.post(API_URL, json=payload)
-                            response.raise_for_status()
-                            result = response.json()
-                            shap_dict = result.get("shap_top_contributors", {})
-                            if shap_dict:
-                                shap_df = pd.DataFrame.from_dict(shap_dict, orient='index', columns=["SHAP Value"])
-                                shap_df["Feature"] = shap_df.index
-                                shap_df = shap_df.sort_values("SHAP Value", key=abs, ascending=False)
-                                with shap_cols[i % 2]:
-                                    st.markdown(f"**{model.upper()} SHAP**")
-                                    fig = px.bar(shap_df, x="Feature", y="SHAP Value", title=f"{model.upper()} Explanation")
-                                    st.plotly_chart(fig, use_container_width=True)
-                        except:
-                            pass
+        selected_gnn_row = st.selectbox("Select transaction for GNN", df.index, key="select_gnn")
+
+        if st.button("Predict with GNN", key="predict_gnn_btn"):
+            row = df.loc[selected_gnn_row].to_dict()
+            input_gnn = {k: row[k] for k in gnn_cols if k in row}
+
+            try:
+                response = requests.post(gnn_api_url, json=input_gnn)
+                response.raise_for_status()
+                result = response.json()
+                pred = "FRAUD" if result["prediction"] else "LEGITIMATE"
+                st.markdown("#### GNN Model Result")
+                st.dataframe(pd.DataFrame([{
+                    "Model": gnn_model.upper(),
+                    "Prediction": pred,
+                    "Fraud Probability": f"{result['fraud_probability']*100:.2f}%"
+                }]), use_container_width=True)
+            except Exception as e:
+                st.error(f"GNN Prediction Failed: {str(e)}")
 
 with tab3:
     st.subheader("Advanced Test Case (Full Feature Input)")

@@ -1,119 +1,65 @@
 import requests
 import json
-import random
-from datetime import datetime
 
-# This is the URL where the Flask API is running
-url = "http://127.0.0.1:5000/predict_full"
+# URL for the GNN prediction endpoint
+gnn_url = "http://127.0.0.1:5000/predict_gnn"
 
-# We're only testing traditional ML models here (not autoencoder or GNN)
-models_to_test = [
-    "randomforest",
-    "xgboost",
-    "logisticregression",
-    "gradientboosting",
-    "mlp"
-]
+# Hand-crafted suspicious transaction (values are exaggerated to simulate fraud)
+known_fraud_case = {
+    "TransactionAmt": 99999.99,
+    "TransactionDT": 172800,
+    "card3": 255,
+    "card4": "discover",
+    "C5": 5.0,
+    "C6": 4.5,
+    "C8": 6.0,
+    "C9": 7.0,
+    "ProductCD": "W",
+    "DeviceInfo": "jailbroken-rooted-hackOS",
+    "id_01": 9.9,
+    "id_02": 8.8,
+    "id_16": "not_found",
+    "id_31": "bot_browser",
+    "id_36": 1.0,
+    "V9": 0.99,
+    "V46": 0.98,
+    "V51": 0.97,
+    "V98": 0.96,
+    "V103": 0.95,
+    "V115": 0.94,
+    "V132": 0.93,
+    "V134": 0.92,
+    "V172": 0.91,
+    "V180": 0.90,
+    "V183": 0.89,
+    "V184": 0.88,
+    "V185": 0.87,
+    "V204": 0.86,
+    "V210": 0.85,
+    "V213": 0.84,
+    "V224": 0.83,
+    "V228": 0.82,
+    "V232": 0.81,
+    "V233": 0.80,
+    "V235": 0.79,
+    "V239": 0.78,
+    "V252": 0.77,
+    "V258": 0.76,
+    "V261": 0.75,
+    "V276": 0.74,
+    "V291": 0.73,
+    "V302": 0.72,
+    "V319": 0.71,
+    "V320": 0.70,
+}
 
-# This function creates a realistic-looking, everyday transaction
-# It simulates a typical purchase by a customer using normal feature values
-def generate_normal_transaction():
-    transaction = {
-        "TransactionAmt": round(random.uniform(5, 500), 2),
-        "card1": random.randint(1000, 8000),
-        "card2": random.randint(100, 600),
-        "card3": random.randint(100, 250),
-        "card4": random.choice(["visa", "mastercard"]),
-        "card5": random.randint(100, 300),
-        "card6": random.choice(["debit", "credit"]),
-        "addr1": random.randint(100, 500),
-        "addr2": random.randint(50, 100),
-        "dist1": random.uniform(0, 50),
-        "dist2": random.uniform(0, 20),
-        "TransactionDT": random.randint(86400, 172800),
-        "P_emaildomain": random.choice(["gmail.com", "yahoo.com"]),
-        "R_emaildomain": random.choice(["gmail.com", "yahoo.com"]),
-        "DeviceType": random.choice(["desktop", "mobile"])
-    }
+# Send request to GNN API
+response = requests.post(gnn_url, json=known_fraud_case)
 
-    # Add more features that models might expect (like count and distance values)
-    for i in range(1, 15):
-        transaction[f"C{i}"] = random.randint(0, 2)
-    for i in range(1, 16):
-        transaction[f"D{i}"] = random.randint(0, 30)
-    for i in range(1, 340):
-        transaction[f"V{i}"] = round(random.uniform(0, 0.5), 4)
-
-    return transaction
-
-# This one simulates a high-risk or suspicious transaction.
-# Values here are deliberately out-of-the-ordinary to mimic fraud behavior.
-def generate_fraud_like_transaction():
-    transaction = {
-        "TransactionAmt": round(random.uniform(10000, 100000), 2),
-        "card1": random.randint(9000, 999999),
-        "card2": random.randint(100, 600),
-        "card3": random.randint(100, 250),
-        "card4": random.choice(["visa", "mastercard", "american express", "discover"]),
-        "card5": random.randint(100, 300),
-        "card6": random.choice(["debit", "credit"]),
-        "addr1": random.randint(100, 500),
-        "addr2": random.randint(50, 100),
-        "dist1": random.uniform(0, 500),
-        "dist2": random.uniform(0, 100),
-        "TransactionDT": random.randint(86400, 172800),
-        "P_emaildomain": random.choice(["gmail.com", "yahoo.com", "hotmail.com", "aol.com"]),
-        "R_emaildomain": random.choice(["gmail.com", "yahoo.com", "hotmail.com", "aol.com"]),
-        "DeviceType": random.choice(["desktop", "mobile", "toaster", "tablet"])
-    }
-
-    # Inject wider and more extreme values to make it look suspicious
-    for i in range(1, 15):
-        transaction[f"C{i}"] = random.randint(0, 5)
-    for i in range(1, 16):
-        transaction[f"D{i}"] = random.randint(0, 100)
-    for i in range(1, 340):
-        transaction[f"V{i}"] = round(random.uniform(0, 1), 4)
-
-    return transaction
-
-# === Main testing loop ===
-for model_name in models_to_test:
-    # Decide randomly whether to test a fraud-like or normal transaction
-    if random.random() < 0.3:
-        transaction = generate_fraud_like_transaction()
-        transaction_type = "fraud-like"
-    else:
-        transaction = generate_normal_transaction()
-        transaction_type = "normal"
-
-    # Tell the API which model to use
-    transaction["model"] = model_name
-
-    try:
-        # Send transaction to the Flask API
-        response = requests.post(url, json=transaction)
-        response.raise_for_status()
-
-        # Get the API response
-        result = response.json()
-
-        # Print out the results so we can inspect them
-        print(f"\n=== Testing model: {model_name} ({transaction_type}) ===")
-        print("Status Code:", response.status_code)
-        print("JSON Response:")
-        print(json.dumps(result, indent=4))
-
-        # Save the response to a file in case we want to compare later
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        file_name = f"output_{model_name}_{transaction_type}_{timestamp}.txt"
-        with open(file_name, "w") as f:
-            f.write(f"=== Model: {model_name} ({transaction_type}) ===\n")
-            f.write(f"Status Code: {response.status_code}\n")
-            f.write(json.dumps(result, indent=4))
-            f.write("\n")
-
-    except Exception as e:
-        print(f"\n=== Testing model: {model_name} ({transaction_type}) ===")
-        print(f"Failed to get prediction for {model_name}!")
-        print("Error:", str(e))
+# Print result
+print("\n=== Known Fraud Test Case (High-Risk Input) ===")
+if response.status_code == 200:
+    print("Prediction Response:")
+    print(json.dumps(response.json(), indent=4))
+else:
+    print(f"Error {response.status_code}: {response.text}")
