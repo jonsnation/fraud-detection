@@ -9,6 +9,8 @@ from flask import Flask, request, jsonify
 from torch_geometric.data import Data
 from torch_geometric.nn import GCNConv
 import torch.nn as nn
+import pickle
+from itertools import combinations, islice
 
 # === Resolve project root ===
 project_root = Path(__file__).resolve()
@@ -71,9 +73,17 @@ manual_models = {name: joblib.load(manual_model_dir / f"{name}_manual_model.pkl"
 stream_models = {name: joblib.load(stream_model_dir / f"{name}_selected_model.pkl") for name in ["randomforest", "xgboost", "logisticregression", "gradientboosting", "mlp"]}
 
 # === Load GNN Model from .pt ===
-gnn_model = FraudGNN(input_dim=len(gnn_features))
-gnn_state_dict = torch.load(project_root / "gnn" / "best_fraudgnn_model.pt", map_location="cpu")
+# === Load GNN model structure from .pkl and then load weights from .pt ===
 
+
+gnn_model_pkl_path = project_root / "gnn" / "fraudgnn_model.pkl"
+gnn_model_weights_path = project_root / "gnn" / "best_fraudgnn_model.pt"
+
+with open(gnn_model_pkl_path, "rb") as f:
+    gnn_model = pickle.load(f)
+
+# Ensure consistency by loading fresh weights
+gnn_state_dict = torch.load(gnn_model_weights_path, map_location="cpu")
 gnn_model.load_state_dict(gnn_state_dict)
 gnn_model.eval()
 
@@ -86,9 +96,18 @@ for name in ["xgboost", "randomforest"]:
     except Exception as e:
         print(f"SHAP setup failed for {name}: {e}")
 
-# === Dummy edge constructor ===
-def create_dummy_edges(_row):
-    return torch.tensor([[0]*len(gnn_edge_fields), [0]*len(gnn_edge_fields)], dtype=torch.long)
+def create_edges(feature_column, df, max_edges_per_group=100):
+    edge_list = []
+    groups = df.groupby(feature_column).indices
+    for _, indices in groups.items():
+        if len(indices) < 2:
+            continue
+        pair_generator = combinations(indices, 2)
+        limited_pairs = list(islice(pair_generator, max_edges_per_group))
+        edge_list.extend(limited_pairs)
+    if not edge_list:
+        return torch.empty((2, 0), dtype=torch.int32)
+    return torch.tensor(edge_list, dtype=torch.int32).t().contiguous()
 
 # === Tab 1 Manual Prediction Endpoint ===
 @app.route('/predict_manual', methods=['POST'])
@@ -167,44 +186,68 @@ def predict_stream():
         "shap_top_contributors": shap_out
     })
 
-@app.route('/predict_gnn', methods=['POST'])
-def predict_gnn():
+
+@app.route('/predict_gnn_with_context', methods=['POST'])
+def predict_gnn_with_context():
     try:
-        data = request.get_json(force=True)
+        print("Loading reduced features and labels exactly as used in training...")
+        X = pd.read_csv(project_root / "gnn" / "reduced_features.csv").tail(100000).reset_index(drop=True)
+        y = pd.read_csv(project_root / "gnn" / "balanced_labels.csv").squeeze().tail(len(X)).reset_index(drop=True)
 
-        # === Extract only GNN input fields ===
-        node_input = {k: data.get(k, 0) for k in gnn_features}
+        print("Receiving new transaction...")
+        new_txn = request.get_json(force=True)
+        if not isinstance(new_txn, dict):
+            return jsonify({"error": "Invalid input. Expecting JSON object"}), 400
 
-        # === Hash encode any categorical/string features ===
-        categorical_fields = ["ProductCD", "card4", "DeviceInfo", "id_31", "id_16"]
-        for field in categorical_fields:
-            if field in node_input and isinstance(node_input[field], str):
-                node_input[field] = hash(node_input[field]) % 1000  # Simple hash encoding
+        print("Appending transaction without transformation...")
+        df_new = pd.DataFrame([new_txn])
+        df_all = pd.concat([X, df_new], ignore_index=True)
 
-        # === Convert input into tensor ===
-        df_input = pd.DataFrame([node_input])
-        x_tensor = torch.tensor(df_input.values, dtype=torch.float32)
+        # Ensure all GNN features exist (no missing columns)
+        for col in gnn_features:
+            if col not in df_all.columns:
+                df_all[col] = 0
 
-        # === Construct dummy edge_index ===
-        edge_index = create_dummy_edges(data)  # You can enhance this later for real graphs
+        print("Dropping relational edge fields from node feature matrix...")
+        x_node = df_all.drop(columns=gnn_edge_fields, errors='ignore')
 
-        # === GNN Inference ===
-        gnn_data = Data(x=x_tensor, edge_index=edge_index)
+        print("Building edge index using training-style relational logic...")
+        edge_index = torch.empty((2, 0), dtype=torch.int32)
+        for feature in gnn_edge_fields:
+            if feature in df_all.columns:
+                edges = create_edges(feature, df_all, max_edges_per_group=100)
+                edge_index = torch.cat([edge_index, edges], dim=1)
+
+        print(f"Total edges formed: {edge_index.shape[1]}")
+
+        print("Preparing PyG Data object...")
+        # Coerce all columns to float32, replacing non-convertible entries with 0.0
+        print("Coercing all features to float32...")
+        x_node = x_node.apply(pd.to_numeric, errors='coerce').fillna(0.0).astype(np.float32)
+
+
+        x_tensor = torch.tensor(x_node.values, dtype=torch.float32)
+
+        y_tensor = torch.cat([torch.tensor(y.values, dtype=torch.float32), torch.tensor([0.0])])
+
+        data = Data(x=x_tensor, edge_index=edge_index, y=y_tensor)
+
+        print("Running model inference...")
+        gnn_model.eval()
         with torch.no_grad():
-            output = gnn_model(gnn_data).view(-1)
-            prob = float(output.item())
+            out = gnn_model(data).squeeze()
+            prob = float(out[-1].item())
             pred = int(prob > 0.5)
 
-
+        print(f"Prediction: {pred} (probability: {prob:.4f})")
         return jsonify({
             "model_used": "fraudgnn",
-            "input": node_input,
             "prediction": pred,
             "fraud_probability": round(prob, 4)
         })
 
     except Exception as e:
-        print("GNN Prediction Error:", e)
+        print("GNN Context Prediction Error:", e)
         return jsonify({"error": str(e)}), 500
 
 
