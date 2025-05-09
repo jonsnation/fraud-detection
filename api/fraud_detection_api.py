@@ -13,6 +13,10 @@ import pickle
 from itertools import combinations, islice
 from tensorflow.keras.models import load_model
 import traceback
+import warnings
+
+warnings.filterwarnings("ignore")
+
 
 # === Resolve project root ===
 project_root = Path(__file__).resolve()
@@ -124,22 +128,68 @@ def create_edges(feature_column, df, max_edges_per_group=100):
         edge_list.extend(limited_pairs)
     return torch.tensor(edge_list, dtype=torch.int32).t().contiguous() if edge_list else torch.empty((2, 0), dtype=torch.int32)
 
+# === Tab 1 Manual Prediction Endpoint ===
+
+@app.route('/predict_manual', methods=['POST'])
+def predict_manual():
+    data = request.get_json(force=True)
+    model_name = data.get("model", "xgboost").lower()
+    model = manual_models.get(model_name)
+    if not model:
+        return jsonify({"error": f"Model '{model_name}' not found"}), 400
+
+    # Feature engineering
+    row = {
+        "TransactionAmt": data.get("TransactionAmt", 0),
+        "card1": data.get("card1", 0),
+        "addr1": data.get("addr1", 0),
+        "dist1": data.get("dist1", 0),
+        "ProductCD_freq": product_freq.get(data.get("ProductCD", ""), 0),
+        "P_emaildomain_freq": email_freq.get(data.get("P_emaildomain", "").lower(), 0),
+    }
+
+    df = pd.DataFrame([row]).reindex(columns=manual_features, fill_value=0)
+    X = manual_preprocessor.transform(df)
+
+    try:
+        y_pred = int(model.predict(X)[0])
+        prob = float(model.predict_proba(X)[0][1])
+    except Exception as e:
+        return jsonify({"error": f"Prediction failed: {str(e)}"}), 500
+
+    return jsonify({
+        "model_used": model_name,
+        "input": data,
+        "filled_input": df.iloc[0].to_dict(),
+        "prediction": y_pred,
+        "fraud_probability": round(prob, 4)
+    })
+
+
 # === Endpoint: /predict_stream ===
 @app.route('/predict_stream', methods=['POST'])
 def predict_stream():
+    print("[HIT] /predict_stream endpoint")
     try:
         data = request.get_json(force=True)
         model_name = data.get("model", "xgboost").lower()
-        model = stream_models.get(model_name)
-        if not model:
+        print(f"\n[REQUEST] Model: {model_name}")
+
+        if model_name not in stream_models:
+            print(f"[ERROR] Model '{model_name}' not found")
             return jsonify({"error": f"Model '{model_name}' not found"}), 400
 
+        model = stream_models[model_name]
+
         df = pd.DataFrame([data]).reindex(columns=stream_features, fill_value=0)
-        df = df[stream_features]
+        print("[DEBUG] DataFrame for prediction:\n", df)
+
         X = stream_preprocessor.transform(df)
+        print("[DEBUG] Transformed shape:", X.shape)
 
         y_pred = int(model.predict(X)[0])
         prob = float(model.predict_proba(X)[0][1])
+
         mse, flagged = flag_anomaly_with_autoencoder(data)
 
         return jsonify({
@@ -153,9 +203,11 @@ def predict_stream():
         })
 
     except Exception as e:
-        print("Stream Prediction Error:", e)
+        import traceback
+        print("\n[EXCEPTION]")
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
 
 # === Endpoint: /predict_gnn_with_context ===
 @app.route('/predict_gnn_with_context', methods=['POST'])
@@ -203,6 +255,53 @@ def predict_gnn_with_context():
         print("GNN Context Prediction Error:", e)
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+    
+from collections import deque
+
+# In-memory buffer to simulate stream
+stream_buffer = deque(maxlen=100)
+
+@app.route('/stream', methods=['POST'])
+def receive_streamed_txn():
+    try:
+        txn = request.get_json(force=True)
+        # print(f"Received txn: {txn}")  
+        stream_buffer.appendleft(txn)
+        return jsonify({"status": "received", "buffer_size": len(stream_buffer)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/get_stream', methods=['GET'])
+def get_streamed_txns():
+    # print(f"Sending {len(stream_buffer)} records")  
+    return jsonify(list(stream_buffer))
+
+
+@app.route("/record_stream", methods=["POST"])
+def record_stream():
+    try:
+        payload = request.get_json(force=True)
+
+        # Auto-tag type if not specified
+        if "type" not in payload:
+            if "card1" in payload:
+                payload["type"] = "tree"
+            else:
+                payload["type"] = "gnn"
+
+        stream_buffer.append(payload)
+        return jsonify({"status": "recorded", "count": len(stream_buffer)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/get_stream", methods=["GET"])
+def get_stream():
+    try:
+        return jsonify(list(stream_buffer))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 # === Run Flask Server ===
 if __name__ == '__main__':
