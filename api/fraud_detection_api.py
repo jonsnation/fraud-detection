@@ -277,31 +277,6 @@ def get_streamed_txns():
     return jsonify(list(stream_buffer))
 
 
-@app.route("/record_stream", methods=["POST"])
-def record_stream():
-    try:
-        payload = request.get_json(force=True)
-
-        # Auto-tag type if not specified
-        if "type" not in payload:
-            if "card1" in payload:
-                payload["type"] = "tree"
-            else:
-                payload["type"] = "gnn"
-
-        stream_buffer.append(payload)
-        return jsonify({"status": "recorded", "count": len(stream_buffer)})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/get_stream", methods=["GET"])
-def get_stream():
-    try:
-        return jsonify(list(stream_buffer))
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
 
 # === Run Flask Server ===
 if __name__ == '__main__':
