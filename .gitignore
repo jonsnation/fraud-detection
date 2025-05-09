@@ -1,6 +1,5 @@
 # Ignore datasets
 data/raw/*
-data/processed/*
 
 # Ignore virtual environment
 venv/
@@ -9,3 +8,7 @@ __pycache__/
 # Ignore logs
 logs/
 *.log
+
+# *.pkl
+*.csv
+*.txt
