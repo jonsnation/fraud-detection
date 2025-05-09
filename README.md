@@ -14,4 +14,7 @@ Fraud not only results in significant financial losses but also undermines publi
 ## Expected Outcomes
 The project aims to produce a high-accuracy fraud detection model capable of analyzing transactions in real-time. A monitoring dashboard built with Streamlit or Dash will provide visual insights into transaction risks, while an API developed using Flask will allow real-world integration. Explainable AI methods will enhance the interpretability of the model's predictions. The final deliverables will include a comprehensive report detailing the project's methodology, findings, and recommendations for practical implementation.
 
+## Instructions for Streaming
+To test the streaming a docker instance must be started using the files contained in the streaming folder and the commands: docker-compose up --build to start and Ctrl + C to stop as well as docker-compose down to clean the instance. The api should be started via a python terminal with the dependencies outlined in the requirements.txt file through the command python3 fraud_detection_api.py within the api subfolder. The sample transactions will be streamed automatically and the results can be observed in the terminal running the docker instance. 
+To change the model being used for evaluating the transactions the relevant lines need to be changed to the commented out lines within producer.py and spark_app.py
 
